@@ -1,0 +1,864 @@
+name: Build PercentCalc
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Write source files
+        run: |
+          mkdir -p app/Resources
+          cat > 'app/AppDelegate.h' <<'__EOF__'
+          #import <UIKit/UIKit.h>
+
+          @interface AppDelegate : UIResponder <UIApplicationDelegate>
+          @property (nonatomic, strong) UIWindow *window;
+          @end
+          __EOF__
+          cat > 'app/AppDelegate.m' <<'__EOF__'
+          #import "AppDelegate.h"
+          #import "PercentViewController.h"
+
+          @implementation AppDelegate
+
+          - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+              self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+              self.window.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+              self.window.rootViewController = [[PercentViewController alloc] init];
+              [self.window makeKeyAndVisible];
+              return YES;
+          }
+
+          @end
+          __EOF__
+          cat > 'app/Makefile' <<'__EOF__'
+          TARGET := iphone:clang:latest:14.0
+          ARCHS = arm64
+          INSTALL_TARGET_PROCESSES = PercentCalc
+
+          include $(THEOS)/makefiles/common.mk
+
+          APPLICATION_NAME = PercentCalc
+
+          PercentCalc_FILES = main.m AppDelegate.m PercentViewController.m
+          PercentCalc_FRAMEWORKS = UIKit
+          PercentCalc_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-error
+
+          include $(THEOS_MAKE_PATH)/application.mk
+          __EOF__
+          cat > 'app/PercentViewController.h' <<'__EOF__'
+          #import <UIKit/UIKit.h>
+
+          @interface PercentViewController : UIViewController
+          @end
+          __EOF__
+          cat > 'app/PercentViewController.m' <<'__EOF__'
+          #import "PercentViewController.h"
+
+          // 입력 칸
+          typedef NS_ENUM(NSInteger, PCField) {
+              PCFieldBase = 0,     // 기준값 (예: 100)
+              PCFieldPercent = 1,  // 퍼센트 (예: 30)
+              PCFieldResult = 2,   // 결과/목표값 (예: 130)
+          };
+
+          #define PC_ORANGE [UIColor colorWithRed:1.0 green:0.62 blue:0.04 alpha:1.0]
+          #define PC_DARK   [UIColor colorWithWhite:0.20 alpha:1.0]
+          #define PC_LIGHT  [UIColor colorWithWhite:0.65 alpha:1.0]
+          #define PC_BOX    [UIColor colorWithWhite:0.11 alpha:1.0]
+
+          static const NSUInteger kMaxLength = 12;
+
+          @interface PercentViewController ()
+          // 상태
+          @property (nonatomic, strong) NSMutableString *baseText;
+          @property (nonatomic, strong) NSMutableString *percentText;
+          @property (nonatomic, strong) NSMutableString *resultText;
+          @property (nonatomic, assign) BOOL negative;      // NO = +, YES = −
+          @property (nonatomic, assign) BOOL reverseMode;   // YES면 결과값을 입력하고 %를 계산
+          @property (nonatomic, assign) PCField active;
+          @property (nonatomic, assign) double computedPercent; // reverse 모드 계산값 (절댓값)
+          @property (nonatomic, assign) double computedResult;  // forward 모드 계산값
+          @property (nonatomic, assign) BOOL hasComputed;
+
+          // 화면
+          @property (nonatomic, strong) NSArray<UIView *> *boxes;
+          @property (nonatomic, strong) NSArray<UILabel *> *captions;
+          @property (nonatomic, strong) NSArray<UILabel *> *values;
+          @property (nonatomic, strong) UIButton *signButton;
+          @property (nonatomic, strong) UILabel *hintLabel;
+          @property (nonatomic, strong) UIButton *plusKey;
+          @property (nonatomic, strong) UIButton *minusKey;
+          @property (nonatomic, strong) UIImpactFeedbackGenerator *haptic;
+          @property (nonatomic, strong) NSNumberFormatter *displayFormatter;
+          @property (nonatomic, strong) NSNumberFormatter *rawFormatter;
+          @end
+
+          @implementation PercentViewController
+
+          - (UIStatusBarStyle)preferredStatusBarStyle { return UIStatusBarStyleLightContent; }
+
+          - (void)viewDidLoad {
+              [super viewDidLoad];
+              self.view.backgroundColor = UIColor.blackColor;
+              self.haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+
+              self.displayFormatter = [[NSNumberFormatter alloc] init];
+              self.displayFormatter.numberStyle = NSNumberFormatterDecimalStyle;
+              self.displayFormatter.maximumFractionDigits = 2;
+              self.displayFormatter.locale = [NSLocale localeWithLocaleIdentifier:@"ko_KR"];
+
+              self.rawFormatter = [[NSNumberFormatter alloc] init];
+              self.rawFormatter.numberStyle = NSNumberFormatterDecimalStyle;
+              self.rawFormatter.usesGroupingSeparator = NO;
+              self.rawFormatter.maximumFractionDigits = 4;
+              self.rawFormatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+
+              self.baseText = [NSMutableString string];
+              self.percentText = [NSMutableString string];
+              self.resultText = [NSMutableString string];
+              self.active = PCFieldBase;
+
+              UIView *display = [self buildDisplay];
+              UIView *keypad = [self buildKeypad];
+              [self.view addSubview:display];
+              [self.view addSubview:keypad];
+
+              UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+              [NSLayoutConstraint activateConstraints:@[
+                  [keypad.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+                  [keypad.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+                  [keypad.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8],
+                  [keypad.heightAnchor constraintEqualToAnchor:keypad.widthAnchor multiplier:1.12],
+
+                  [display.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+                  [display.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+                  [display.bottomAnchor constraintEqualToAnchor:keypad.topAnchor constant:-16],
+                  [display.topAnchor constraintGreaterThanOrEqualToAnchor:safe.topAnchor constant:8],
+              ]];
+
+              [self refresh];
+          }
+
+          #pragma mark - 화면 구성
+
+          - (UIView *)makeBoxWithCaption:(NSString *)caption field:(PCField)field
+                                 caption:(UILabel **)captionOut value:(UILabel **)valueOut {
+              UIView *box = [[UIView alloc] init];
+              box.translatesAutoresizingMaskIntoConstraints = NO;
+              box.backgroundColor = PC_BOX;
+              box.layer.cornerRadius = 16;
+              box.layer.borderWidth = 2;
+              box.tag = field;
+              [box addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(boxTapped:)]];
+
+              UILabel *cap = [[UILabel alloc] init];
+              cap.translatesAutoresizingMaskIntoConstraints = NO;
+              cap.text = caption;
+              cap.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+              cap.textColor = PC_LIGHT;
+              [box addSubview:cap];
+
+              UILabel *val = [[UILabel alloc] init];
+              val.translatesAutoresizingMaskIntoConstraints = NO;
+              val.font = [UIFont monospacedDigitSystemFontOfSize:40 weight:UIFontWeightLight];
+              val.textColor = UIColor.whiteColor;
+              val.textAlignment = NSTextAlignmentRight;
+              val.adjustsFontSizeToFitWidth = YES;
+              val.minimumScaleFactor = 0.4;
+              [box addSubview:val];
+
+              [NSLayoutConstraint activateConstraints:@[
+                  [box.heightAnchor constraintEqualToConstant:70],
+                  [cap.topAnchor constraintEqualToAnchor:box.topAnchor constant:8],
+                  [cap.leadingAnchor constraintEqualToAnchor:box.leadingAnchor constant:14],
+                  [val.leadingAnchor constraintEqualToAnchor:box.leadingAnchor constant:14],
+                  [val.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-14],
+                  [val.bottomAnchor constraintEqualToAnchor:box.bottomAnchor constant:-6],
+              ]];
+              *captionOut = cap;
+              *valueOut = val;
+              return box;
+          }
+
+          - (UIView *)buildDisplay {
+              UILabel *c0, *c1, *c2, *v0, *v1, *v2;
+              UIView *baseBox = [self makeBoxWithCaption:@"기준값" field:PCFieldBase caption:&c0 value:&v0];
+              UIView *pctBox = [self makeBoxWithCaption:@"퍼센트" field:PCFieldPercent caption:&c1 value:&v1];
+              UIView *resBox = [self makeBoxWithCaption:@"결과" field:PCFieldResult caption:&c2 value:&v2];
+              v2.font = [UIFont monospacedDigitSystemFontOfSize:44 weight:UIFontWeightSemibold];
+              self.boxes = @[baseBox, pctBox, resBox];
+              self.captions = @[c0, c1, c2];
+              self.values = @[v0, v1, v2];
+
+              // + / − 표시 (눌러서 바꾸기)
+              self.signButton = [UIButton buttonWithType:UIButtonTypeCustom];
+              self.signButton.translatesAutoresizingMaskIntoConstraints = NO;
+              self.signButton.titleLabel.font = [UIFont systemFontOfSize:34 weight:UIFontWeightMedium];
+              self.signButton.layer.cornerRadius = 16;
+              [self.signButton addTarget:self action:@selector(signTapped) forControlEvents:UIControlEventTouchUpInside];
+
+              UIStackView *pctRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.signButton, pctBox]];
+              pctRow.spacing = 10;
+              [self.signButton.widthAnchor constraintEqualToConstant:64].active = YES;
+
+              UILabel *eq = [[UILabel alloc] init];
+              eq.text = @"=";
+              eq.font = [UIFont systemFontOfSize:34 weight:UIFontWeightMedium];
+              eq.textColor = PC_LIGHT;
+              eq.textAlignment = NSTextAlignmentCenter;
+              UIStackView *resRow = [[UIStackView alloc] initWithArrangedSubviews:@[eq, resBox]];
+              resRow.spacing = 10;
+              [eq.widthAnchor constraintEqualToConstant:64].active = YES;
+
+              self.hintLabel = [[UILabel alloc] init];
+              self.hintLabel.font = [UIFont systemFontOfSize:15];
+              self.hintLabel.textColor = PC_LIGHT;
+              self.hintLabel.textAlignment = NSTextAlignmentCenter;
+              self.hintLabel.numberOfLines = 2;
+              self.hintLabel.adjustsFontSizeToFitWidth = YES;
+              self.hintLabel.minimumScaleFactor = 0.7;
+
+              UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[baseBox, pctRow, resRow, self.hintLabel]];
+              stack.axis = UILayoutConstraintAxisVertical;
+              stack.spacing = 10;
+              stack.translatesAutoresizingMaskIntoConstraints = NO;
+              [stack setCustomSpacing:14 afterView:resRow];
+              return stack;
+          }
+
+          - (UIButton *)keyWithTitle:(NSString *)title bg:(UIColor *)bg fg:(UIColor *)fg action:(SEL)action {
+              UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+              [b setTitle:title forState:UIControlStateNormal];
+              [b setTitleColor:fg forState:UIControlStateNormal];
+              b.tintColor = fg;
+              b.backgroundColor = bg;
+              b.titleLabel.font = [UIFont systemFontOfSize:32 weight:UIFontWeightMedium];
+              b.layer.cornerRadius = 22;
+              [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+              return b;
+          }
+
+          - (UIStackView *)rowWith:(NSArray<UIView *> *)views {
+              UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:views];
+              row.spacing = 12;
+              row.distribution = UIStackViewDistributionFillEqually;
+              return row;
+          }
+
+          - (UIView *)buildKeypad {
+              // 1행: ⇄  +  −  ⌫
+              UIButton *swap = [self keyWithTitle:@"⇄" bg:PC_LIGHT fg:UIColor.blackColor action:@selector(swapTapped)];
+              self.plusKey = [self keyWithTitle:@"+" bg:PC_ORANGE fg:UIColor.whiteColor action:@selector(plusTapped)];
+              self.minusKey = [self keyWithTitle:@"−" bg:PC_ORANGE fg:UIColor.whiteColor action:@selector(minusTapped)];
+              UIButton *back = [self keyWithTitle:nil bg:PC_LIGHT fg:UIColor.blackColor action:@selector(backTapped)];
+              [back setImage:[UIImage systemImageNamed:@"delete.left"
+                                     withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:24 weight:UIImageSymbolWeightMedium]]
+                    forState:UIControlStateNormal];
+              UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(backLongPressed:)];
+              [back addGestureRecognizer:lp];
+              UIStackView *top = [self rowWith:@[swap, self.plusKey, self.minusKey, back]];
+
+              // 숫자
+              NSMutableArray *digitRows = [NSMutableArray array];
+              UIButton *seven = nil;
+              for (NSArray *r in @[@[@"7", @"8", @"9"], @[@"4", @"5", @"6"], @[@"1", @"2", @"3"]]) {
+                  NSMutableArray *btns = [NSMutableArray array];
+                  for (NSString *d in r) {
+                      UIButton *b = [self keyWithTitle:d bg:PC_DARK fg:UIColor.whiteColor action:@selector(digitTapped:)];
+                      if ([d isEqualToString:@"7"]) seven = b;
+                      [btns addObject:b];
+                  }
+                  [digitRows addObject:[self rowWith:btns]];
+              }
+              UIButton *zero = [self keyWithTitle:@"0" bg:PC_DARK fg:UIColor.whiteColor action:@selector(digitTapped:)];
+              UIButton *dot = [self keyWithTitle:@"." bg:PC_DARK fg:UIColor.whiteColor action:@selector(digitTapped:)];
+              UIStackView *last = [[UIStackView alloc] initWithArrangedSubviews:@[zero, dot]];
+              last.spacing = 12;
+              [digitRows addObject:last];
+
+              UIStackView *digits = [[UIStackView alloc] initWithArrangedSubviews:digitRows];
+              digits.axis = UILayoutConstraintAxisVertical;
+              digits.spacing = 12;
+              digits.distribution = UIStackViewDistributionFillEqually;
+
+              UIButton *equals = [self keyWithTitle:@"=" bg:PC_ORANGE fg:UIColor.whiteColor action:@selector(equalsTapped)];
+              UIStackView *lower = [[UIStackView alloc] initWithArrangedSubviews:@[digits, equals]];
+              lower.spacing = 12;
+
+              UIStackView *pad = [[UIStackView alloc] initWithArrangedSubviews:@[top, lower]];
+              pad.axis = UILayoutConstraintAxisVertical;
+              pad.spacing = 12;
+              pad.translatesAutoresizingMaskIntoConstraints = NO;
+
+              [NSLayoutConstraint activateConstraints:@[
+                  [dot.widthAnchor constraintEqualToAnchor:seven.widthAnchor],
+                  [equals.widthAnchor constraintEqualToAnchor:seven.widthAnchor],
+                  [top.heightAnchor constraintEqualToAnchor:last.heightAnchor],
+              ]];
+              return pad;
+          }
+
+          #pragma mark - 숫자 변환
+
+          - (NSMutableString *)textFor:(PCField)f {
+              if (f == PCFieldBase) return self.baseText;
+              if (f == PCFieldPercent) return self.percentText;
+              return self.resultText;
+          }
+
+          - (BOOL)hasValue:(NSString *)s {
+              return s.length > 0 && ![s isEqualToString:@"."];
+          }
+
+          - (NSString *)rawString:(double)v {
+              return [self.rawFormatter stringFromNumber:@(v)] ?: @"";
+          }
+
+          // 입력 중인 글자를 1,234.5 처럼 보기 좋게
+          - (NSString *)prettyInput:(NSString *)s {
+              if (!s.length) return @"0";
+              NSRange dot = [s rangeOfString:@"."];
+              NSString *intPart = dot.location == NSNotFound ? s : [s substringToIndex:dot.location];
+              NSString *rest = dot.location == NSNotFound ? @"" : [s substringFromIndex:dot.location];
+              NSNumberFormatter *f = [[NSNumberFormatter alloc] init];
+              f.numberStyle = NSNumberFormatterDecimalStyle;
+              f.maximumFractionDigits = 0;
+              NSString *grouped = [f stringFromNumber:@(intPart.length ? intPart.longLongValue : 0)];
+              return [grouped stringByAppendingString:rest];
+          }
+
+          - (NSString *)pretty:(double)v {
+              return [self.displayFormatter stringFromNumber:@(v)] ?: @"";
+          }
+
+          #pragma mark - 계산
+
+          - (void)compute {
+              self.hasComputed = NO;
+              if (![self hasValue:self.baseText]) return;
+              double base = self.baseText.doubleValue;
+
+              if (!self.reverseMode) {
+                  if (![self hasValue:self.percentText]) return;
+                  double p = self.percentText.doubleValue * (self.negative ? -1 : 1);
+                  self.computedResult = base * (1.0 + p / 100.0);
+                  self.hasComputed = YES;
+              } else {
+                  if (![self hasValue:self.resultText] || base == 0) return;
+                  double target = self.resultText.doubleValue;
+                  double p = (target / base - 1.0) * 100.0;
+                  self.negative = (p < 0);
+                  self.computedPercent = fabs(p);
+                  self.hasComputed = YES;
+              }
+          }
+
+          - (void)refresh {
+              [self compute];
+              PCField computedField = self.reverseMode ? PCFieldPercent : PCFieldResult;
+
+              for (NSInteger i = 0; i < 3; i++) {
+                  UIView *box = self.boxes[(NSUInteger)i];
+                  UILabel *val = self.values[(NSUInteger)i];
+                  BOOL isComputed = (i == computedField);
+                  box.layer.borderColor = (i == self.active && !isComputed) ? PC_ORANGE.CGColor : UIColor.clearColor.CGColor;
+
+                  NSString *text;
+                  if (isComputed) {
+                      text = self.hasComputed ? [self pretty:(self.reverseMode ? self.computedPercent : self.computedResult)] : @"—";
+                      val.textColor = PC_ORANGE;
+                  } else {
+                      NSString *t = [self textFor:i];
+                      text = [self prettyInput:t];
+                      val.textColor = t.length ? UIColor.whiteColor : [UIColor colorWithWhite:0.35 alpha:1.0];
+                  }
+                  if (i == PCFieldPercent) text = [text stringByAppendingString:@" %"];
+                  val.text = text;
+              }
+
+              self.captions[1].text = self.reverseMode ? @"필요한 퍼센트" : @"퍼센트";
+              self.captions[2].text = self.reverseMode ? @"목표값" : @"결과";
+
+              // + / − 표시
+              NSString *sign = self.negative ? @"−" : @"+";
+              [self.signButton setTitle:sign forState:UIControlStateNormal];
+              self.signButton.backgroundColor = self.reverseMode ? PC_BOX : PC_ORANGE;
+              [self.signButton setTitleColor:(self.reverseMode ? PC_ORANGE : UIColor.whiteColor) forState:UIControlStateNormal];
+
+              // 선택된 부호 키 강조
+              BOOL showSign = !self.reverseMode;
+              [self styleOpKey:self.plusKey selected:(showSign && !self.negative)];
+              [self styleOpKey:self.minusKey selected:(showSign && self.negative)];
+
+              self.hintLabel.text = [self hintText];
+          }
+
+          - (void)styleOpKey:(UIButton *)b selected:(BOOL)selected {
+              b.backgroundColor = selected ? UIColor.whiteColor : PC_ORANGE;
+              [b setTitleColor:(selected ? PC_ORANGE : UIColor.whiteColor) forState:UIControlStateNormal];
+          }
+
+          - (NSString *)hintText {
+              if (!self.hasComputed) {
+                  return self.reverseMode ? @"기준값과 목표값을 넣으면 필요한 %를 계산해요"
+                                          : @"기준값과 퍼센트를 넣으면 결과를 계산해요";
+              }
+              double base = self.baseText.doubleValue;
+              if (!self.reverseMode) {
+                  double diff = self.computedResult - base;
+                  return [NSString stringWithFormat:@"%@에서 %@%% %@ → %@  (%@%@)",
+                          [self pretty:base], [self pretty:self.percentText.doubleValue], self.negative ? @"감소" : @"증가",
+                          [self pretty:self.computedResult], diff < 0 ? @"−" : @"+", [self pretty:fabs(diff)]];
+              }
+              double target = self.resultText.doubleValue;
+              double diff = target - base;
+              return [NSString stringWithFormat:@"%@ → %@ 이 되려면 %@%% %@  (%@%@)",
+                      [self pretty:base], [self pretty:target], [self pretty:self.computedPercent],
+                      self.negative ? @"감소" : @"증가", diff < 0 ? @"−" : @"+", [self pretty:fabs(diff)]];
+          }
+
+          #pragma mark - 모드 전환
+
+          // reverse 모드에서 forward 로 (계산된 %를 입력값으로 가져옴)
+          - (void)switchToForward {
+              if (!self.reverseMode) return;
+              if (self.hasComputed) [self.percentText setString:[self rawString:self.computedPercent]];
+              self.reverseMode = NO;
+          }
+
+          // forward 모드에서 reverse 로 (계산된 결과를 입력값으로 가져옴)
+          - (void)switchToReverse {
+              if (self.reverseMode) return;
+              if (self.hasComputed) [self.resultText setString:[self rawString:self.computedResult]];
+              self.reverseMode = YES;
+          }
+
+          #pragma mark - 입력
+
+          - (void)tick { [self.haptic impactOccurred]; }
+
+          - (void)boxTapped:(UITapGestureRecognizer *)g {
+              [self tick];
+              PCField f = (PCField)g.view.tag;
+              if (f == PCFieldPercent) [self switchToForward];
+              if (f == PCFieldResult) [self switchToReverse];
+              self.active = f;
+              [self refresh];
+          }
+
+          - (void)signTapped {
+              [self tick];
+              [self switchToForward];
+              self.negative = !self.negative;
+              [self refresh];
+          }
+
+          - (void)digitTapped:(UIButton *)sender {
+              [self tick];
+              NSString *d = [sender titleForState:UIControlStateNormal];
+              if (self.active == PCFieldPercent) [self switchToForward];
+              if (self.active == PCFieldResult) [self switchToReverse];
+              NSMutableString *t = [self textFor:self.active];
+              if (t.length >= kMaxLength) return;
+              if ([d isEqualToString:@"."]) {
+                  if ([t containsString:@"."]) return;
+                  if (!t.length) [t appendString:@"0"];
+              } else if ([t isEqualToString:@"0"]) {
+                  [t setString:@""];
+              }
+              [t appendString:d];
+              [self refresh];
+          }
+
+          - (void)backTapped {
+              [self tick];
+              NSMutableString *t = [self textFor:self.active];
+              if (t.length) [t deleteCharactersInRange:NSMakeRange(t.length - 1, 1)];
+              [self refresh];
+          }
+
+          // ⌫ 길게 누르기: 칸 비우기
+          - (void)backLongPressed:(UILongPressGestureRecognizer *)g {
+              if (g.state != UIGestureRecognizerStateBegan) return;
+              [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
+              [[self textFor:self.active] setString:@""];
+              [self refresh];
+          }
+
+          - (void)applySign:(BOOL)negative {
+              [self tick];
+              [self switchToForward];
+              self.negative = negative;
+              if (self.active == PCFieldBase || self.active == PCFieldResult) self.active = PCFieldPercent;
+              [self refresh];
+          }
+
+          - (void)plusTapped  { [self applySign:NO]; }
+          - (void)minusTapped { [self applySign:YES]; }
+
+          // = : 다음 입력 칸으로 이동
+          - (void)equalsTapped {
+              [self tick];
+              PCField inputField = self.reverseMode ? PCFieldResult : PCFieldPercent;
+              self.active = (self.active == PCFieldBase) ? inputField : PCFieldBase;
+              [self refresh];
+              UILabel *res = self.values[self.reverseMode ? PCFieldPercent : PCFieldResult];
+              [UIView animateWithDuration:0.12 animations:^{ res.transform = CGAffineTransformMakeScale(1.06, 1.06); }
+                               completion:^(BOOL f) { [UIView animateWithDuration:0.12 animations:^{ res.transform = CGAffineTransformIdentity; }]; }];
+          }
+
+          // ⇄ : 결과를 기준값으로, 기준값을 목표값으로 바꿔 필요한 % 계산
+          - (void)swapTapped {
+              [self tick];
+              [self compute];
+              if (!self.reverseMode) {
+                  if (!self.hasComputed) return;
+                  NSString *oldBase = [self.baseText copy];
+                  [self.baseText setString:[self rawString:self.computedResult]];
+                  [self.resultText setString:oldBase];
+                  self.reverseMode = YES;
+              } else {
+                  NSString *oldBase = [self.baseText copy];
+                  [self.baseText setString:self.resultText];
+                  [self.resultText setString:oldBase];
+              }
+              self.active = PCFieldBase;
+              [self refresh];
+          }
+
+          @end
+          __EOF__
+          cat > /tmp/b64 <<'__EOF__'
+          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
+          __EOF__
+          base64 --decode -i /tmp/b64 -o 'app/Resources/AppIcon60x60@2x.png'
+          cat > /tmp/b64 <<'__EOF__'
+          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
+          hUKhSEf+H2S/UX6/rNptAAAAAElFTkSuQmCC
+          __EOF__
+          base64 --decode -i /tmp/b64 -o 'app/Resources/AppIcon60x60@3x.png'
+          cat > 'app/Resources/Info.plist' <<'__EOF__'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>CFBundleDevelopmentRegion</key>
+          	<string>ko</string>
+          	<key>CFBundleExecutable</key>
+          	<string>PercentCalc</string>
+          	<key>CFBundleIdentifier</key>
+          	<string>com.local.percentcalc</string>
+          	<key>CFBundleInfoDictionaryVersion</key>
+          	<string>6.0</string>
+          	<key>CFBundleName</key>
+          	<string>PercentCalc</string>
+          	<key>CFBundleDisplayName</key>
+          	<string>% 계산기</string>
+          	<key>CFBundlePackageType</key>
+          	<string>APPL</string>
+          	<key>CFBundleShortVersionString</key>
+          	<string>1.0.0</string>
+          	<key>CFBundleVersion</key>
+          	<string>1</string>
+          	<key>CFBundleSupportedPlatforms</key>
+          	<array>
+          		<string>iPhoneOS</string>
+          	</array>
+          	<key>MinimumOSVersion</key>
+          	<string>14.0</string>
+          	<key>UIDeviceFamily</key>
+          	<array>
+          		<integer>1</integer>
+          	</array>
+          	<key>UIRequiredDeviceCapabilities</key>
+          	<array>
+          		<string>arm64</string>
+          	</array>
+          	<key>CFBundleIcons</key>
+          	<dict>
+          		<key>CFBundlePrimaryIcon</key>
+          		<dict>
+          			<key>CFBundleIconFiles</key>
+          			<array>
+          				<string>AppIcon60x60</string>
+          			</array>
+          		</dict>
+          	</dict>
+          	<key>UILaunchScreen</key>
+          	<dict/>
+          	<key>UISupportedInterfaceOrientations</key>
+          	<array>
+          		<string>UIInterfaceOrientationPortrait</string>
+          	</array>
+          	<key>UIUserInterfaceStyle</key>
+          	<string>Dark</string>
+          	<key>UIStatusBarStyle</key>
+          	<string>UIStatusBarStyleLightContent</string>
+          </dict>
+          </plist>
+          __EOF__
+          cat > 'app/control' <<'__EOF__'
+          Package: com.local.percentcalc
+          Name: PercentCalc
+          Version: 1.0.0
+          Architecture: iphoneos-arm
+          Description: Simple percent calculator
+          Maintainer: local
+          Author: local
+          Section: Utilities
+          Depends: firmware (>= 14.0)
+          __EOF__
+          cat > 'app/main.m' <<'__EOF__'
+          #import <UIKit/UIKit.h>
+          #import "AppDelegate.h"
+
+          int main(int argc, char *argv[]) {
+              @autoreleasepool {
+                  return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
+              }
+          }
+          __EOF__
+          find app -type f
+
+      - name: Install Theos
+        run: |
+          brew install ldid make
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Build IPA
+        working-directory: app
+        run: |
+          make clean
+          make stage FINALPACKAGE=1
+          APP=PercentCalc
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$OUT/Payload"
+          cp -R ".theos/_/Applications/$APP.app" "$OUT/Payload/"
+          if command -v ldid >/dev/null; then ldid -S "$OUT/Payload/$APP.app/$APP"; fi
+          cd "$OUT" && zip -qry "$APP.ipa" Payload
+          ls -la "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PercentCalc-ipa
+          path: out/*.ipa
