@@ -285,8 +285,14 @@ jobs:
               digits.spacing = 12;
               digits.distribution = UIStackViewDistributionFillEqually;
 
+              // 오른쪽 열: = (3칸 높이) + AC (전체 지우기)
               UIButton *equals = [self keyWithTitle:@"=" bg:PC_ORANGE fg:UIColor.whiteColor action:@selector(equalsTapped)];
-              UIStackView *lower = [[UIStackView alloc] initWithArrangedSubviews:@[digits, equals]];
+              UIButton *clearAll = [self keyWithTitle:@"AC" bg:PC_LIGHT fg:UIColor.blackColor action:@selector(clearAllTapped)];
+              clearAll.titleLabel.font = [UIFont systemFontOfSize:28 weight:UIFontWeightMedium];
+              UIStackView *rightCol = [[UIStackView alloc] initWithArrangedSubviews:@[equals, clearAll]];
+              rightCol.axis = UILayoutConstraintAxisVertical;
+              rightCol.spacing = 12;
+              UIStackView *lower = [[UIStackView alloc] initWithArrangedSubviews:@[digits, rightCol]];
               lower.spacing = 12;
 
               UIStackView *pad = [[UIStackView alloc] initWithArrangedSubviews:@[top, lower]];
@@ -296,7 +302,8 @@ jobs:
 
               [NSLayoutConstraint activateConstraints:@[
                   [dot.widthAnchor constraintEqualToAnchor:seven.widthAnchor],
-                  [equals.widthAnchor constraintEqualToAnchor:seven.widthAnchor],
+                  [rightCol.widthAnchor constraintEqualToAnchor:seven.widthAnchor],
+                  [clearAll.heightAnchor constraintEqualToAnchor:last.heightAnchor],
                   [top.heightAnchor constraintEqualToAnchor:last.heightAnchor],
               ]];
               return pad;
@@ -509,6 +516,18 @@ jobs:
               UILabel *res = self.values[self.reverseMode ? PCFieldPercent : PCFieldResult];
               [UIView animateWithDuration:0.12 animations:^{ res.transform = CGAffineTransformMakeScale(1.06, 1.06); }
                                completion:^(BOOL f) { [UIView animateWithDuration:0.12 animations:^{ res.transform = CGAffineTransformIdentity; }]; }];
+          }
+
+          // AC : 모든 칸 비우고 처음 상태로
+          - (void)clearAllTapped {
+              [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
+              [self.baseText setString:@""];
+              [self.percentText setString:@""];
+              [self.resultText setString:@""];
+              self.negative = NO;
+              self.reverseMode = NO;
+              self.active = PCFieldBase;
+              [self refresh];
           }
 
           // ⇄ : 결과를 기준값으로, 기준값을 목표값으로 바꿔 필요한 % 계산
